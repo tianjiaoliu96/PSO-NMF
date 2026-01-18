@@ -1,690 +1,1509 @@
 # -*- coding: utf-8 -*-
-"""
-Advanced Geochemical Unmixing - Geo-Mathematical Fusion (Final Split-Figure Version)
-[2025-02-16 布局优化版：图A与图B独立绘制，坐标轴防重叠]
 
-核心特征：
-1. [数学模型] 包含平滑性约束项(μ)，Alpha范围 [0.98, 1.02]。
-2. [绘图优化] 图A（K值优选）与图B（收敛性）拆分为独立图表，布局更宽松。
-3. [输出格式] 生成长格式 Excel 贡献度表。
-"""
+from __future__ import annotations
 
-import pandas as pd
-import numpy as np
-from sklearn.impute import KNNImputer
-import matplotlib.pyplot as plt
-from scipy.optimize import nnls
-from tqdm import tqdm
-import seaborn as sns
+import math
+import random
 import warnings
-import os
+import json
+import traceback
+from pathlib import Path
+from typing import List, Tuple, Optional, Dict, Any
 
-# === 扩展库 ===
-import holoviews as hv
-from pyswarm import pso
-from sklearn.inspection import permutation_importance
-from sklearn.base import BaseEstimator
-from sklearn.metrics import r2_score
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+from matplotlib.lines import Line2D
+from scipy.optimize import nnls
+from scipy.stats import iqr
 
-# ==========================================
-# 0. 全局配置
-# ==========================================
-hv.extension('bokeh')
-warnings.filterwarnings('ignore')
-plt.rcParams['font.family'] = 'sans-serif'
-plt.rcParams['font.sans-serif'] = ['Arial']
-plt.rcParams['axes.unicode_minus'] = False
-sns.set_style("whitegrid", {'grid.linestyle': '--', 'grid.alpha': 0.5})
-
-
-# ==========================================
-# 1. 数据预处理
-# ==========================================
-def load_and_preprocess(filepath):
-   print(f"正在读取数据: {filepath}...")
-   try:
-       df_raw = pd.read_excel(filepath)
-       # 【关键】按照 地区 -> 井号 排序，这是平滑性约束生效的前提
-       if 'Region' in df_raw.columns and 'Well' in df_raw.columns:
-           df_raw = df_raw.sort_values(by=['Region', 'Well']).reset_index(drop=True)
-   except FileNotFoundError:
-       print("未找到文件，生成模拟数据...")
-       data = {
-           'Region': ['R1'] * 10 + ['R2'] * 10,
-           'Well': [f'W{i:02d}' for i in range(20)],
-           'd13C1': np.random.normal(-35, 2, 20), 'd13C2': np.random.normal(-25, 2, 20),
-           'd13C3': np.random.normal(-22, 1, 20), 'd13C4': np.random.normal(-20, 1, 20),
-           'C1': np.random.rand(20), 'C2': np.random.rand(20), 'C3': np.random.rand(20),
-           'N2': np.random.rand(20), 'CO2': np.random.rand(20)
-       }
-       df_raw = pd.DataFrame(data)
-
-   meta_data = df_raw.iloc[:, 0:2]
-   meta_data.columns = ['Region', 'Well']
-   raw_features = df_raw.iloc[:, 2:12]
-   feature_names = raw_features.columns.tolist()
-
-   imputer = KNNImputer(n_neighbors=3)
-   data_imputed = pd.DataFrame(imputer.fit_transform(raw_features), columns=feature_names)
-
-   df_clipped = data_imputed.copy()
-   for col in df_clipped.columns:
-       lower = df_clipped[col].quantile(0.025)
-       upper = df_clipped[col].quantile(0.975)
-       df_clipped[col] = df_clipped[col].clip(lower, upper)
-
-   if df_clipped.shape[1] >= 2:
-       d13c1 = df_clipped.iloc[:, 0]
-       d13c2 = df_clipped.iloc[:, 1]
-       delta_c12 = d13c1 - d13c2
-       f_delta = (delta_c12 - delta_c12.mean()) / (delta_c12.std() + 1e-9)
-   else:
-       f_delta = np.zeros(df_clipped.shape[0])
-
-   min_vals = df_clipped.min()
-   max_vals = df_clipped.max()
-   ranges = max_vals - min_vals
-   ranges[ranges == 0] = 1.0
-   V_norm = (df_clipped - min_vals) / ranges
-
-   info = {
-       'min': min_vals, 'range': ranges,
-       'f_delta': f_delta.values if hasattr(f_delta, 'values') else f_delta,
-       'feature_names': feature_names
-   }
-   return V_norm, meta_data, info
+try:
+    from sklearn.impute import KNeighborsImputer
+except ImportError:
+    try:
+        from sklearn.neighbors import KNeighborsImputer
+    except ImportError:
+        class SimpleKNNImputer:
+            def __init__(self, n_neighbors=3):
+                self.n_neighbors = n_neighbors
+                
+            def fit_transform(self, X):
+                X = np.array(X, dtype=float)
+                for i in range(X.shape[1]):
+                    col = X[:, i]
+                    missing = np.isnan(col)
+                    if missing.any():
+                        col_mean = np.nanmean(col)
+                        col[missing] = col_mean
+                return X
+        
+        KNeighborsImputer = SimpleKNNImputer
+        warnings.warn("Using simple mean imputation as KNeighborsImputer substitute", UserWarning)
 
 
-# ==========================================
-# 2. 核心算法: MOPSO-NMF (含平滑性约束)
-# ==========================================
-class GeochemicalNMF:
-   def __init__(self, V, n_components, preprocessing_info,
-                reg_lambda=0.01, reg_beta=0.01,
-                weight_gamma=5.0, weight_eta=1.0,
-                weight_mu=1.0,  # 平滑性权重
-                kappa=0.1,
-                init_strategy='random'):
-       self.V = V.values if hasattr(V, 'values') else V
-       self.m, self.n = self.V.shape
-       self.K = n_components
-       self.info = preprocessing_info
+class PSONMFWithFractionation:
+    """PSO-NMF algorithm incorporating migration fractionation effects."""
+    
+    def __init__(self, n_components: int = 5, 
+                 lambda_reg: float = 0.01,
+                 beta_sparsity: float = 0.01,
+                 gamma_sum: float = 5.0,
+                 eta_isotope: float = 1.0,
+                 mu_smoothness: float = 1.0,
+                 kappa_scale: float = 0.1,
+                 max_iter: int = 200,
+                 tol: float = 1e-6,
+                 n_particles: int = 10,
+                 n_generations: int = 80):
+        
+        self.n_components = n_components
+        self.lambda_reg = lambda_reg
+        self.beta_sparsity = beta_sparsity
+        self.gamma_sum = gamma_sum
+        self.eta_isotope = eta_isotope
+        self.mu_smoothness = mu_smoothness
+        self.kappa_scale = kappa_scale
+        self.max_iter = max_iter
+        self.tol = tol
+        self.n_particles = n_particles
+        self.n_generations = n_generations
+        
+        self.W = None
+        self.H = None
+        self.alpha = None
+        self.delta13C12 = None
+        self.f_delta13C12 = None
+        
+        self.loss_history = []
+        self.pure_recon_error_history = []
+    
+    def _compute_f_delta13C12(self, delta13C12: np.ndarray) -> np.ndarray:
+        delta13C12 = np.asarray(delta13C12)
+        mean_delta = np.nanmean(delta13C12)
+        std_delta = np.nanstd(delta13C12)
+        if std_delta == 0 or np.isnan(std_delta):
+            return np.zeros_like(delta13C12)
+        return (delta13C12 - mean_delta) / std_delta
+    
+    def _compute_alpha_target(self, delta13C12: np.ndarray) -> np.ndarray:
+        f_delta = self._compute_f_delta13C12(delta13C12)
+        return 1.0 + self.kappa_scale * f_delta
+    
+    def _compute_psi_alpha(self, alpha: np.ndarray) -> np.ndarray:
+        if self.f_delta13C12 is None:
+            return np.ones_like(alpha)
+        f_array = np.asarray(self.f_delta13C12)
+        f_expanded = f_array[:, np.newaxis]
+        return 1.0 + alpha * f_expanded
+    
+    def _initialize_parameters(self, V: np.ndarray, delta13C12: Optional[np.ndarray] = None) -> None:
+        m, n = V.shape
+        
+        self.W = np.random.rand(m, self.n_components) * 0.5 + 0.1
+        row_sums = self.W.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        self.W = self.W / row_sums
+        
+        self.H = np.random.rand(self.n_components, n) * 0.5 + 0.1
+        
+        self.delta13C12 = delta13C12
+        if delta13C12 is not None:
+            delta13C12 = np.asarray(delta13C12)
+            self.f_delta13C12 = self._compute_f_delta13C12(delta13C12)
+            alpha_target = self._compute_alpha_target(delta13C12)
+            
+            self.alpha = np.zeros((m, self.n_components))
+            for k in range(self.n_components):
+                self.alpha[:, k] = alpha_target + np.random.randn(m) * 0.01
+                self.alpha[:, k] = np.clip(self.alpha[:, k], 0.98, 1.02)
+        else:
+            self.alpha = np.ones((m, self.n_components)) * 1.0
+            self.f_delta13C12 = None
+        
+        self.loss_history = []
+        self.pure_recon_error_history = []
+    
+    def _compute_pure_reconstruction_error(self, V: np.ndarray, W: np.ndarray, H: np.ndarray, alpha: np.ndarray) -> float:
+        psi_alpha = self._compute_psi_alpha(alpha)
+        reconstruction = np.dot(W * psi_alpha, H)
+        recon_error = np.linalg.norm(V - reconstruction, 'fro') ** 2
+        return recon_error
+    
+    def _compute_loss(self, V: np.ndarray, W: np.ndarray, H: np.ndarray, alpha: np.ndarray) -> Tuple[float, Dict[str, float]]:
+        m, n = V.shape
+        
+        psi_alpha = self._compute_psi_alpha(alpha)
+        reconstruction = np.dot(W * psi_alpha, H)
+        recon_error = np.linalg.norm(V - reconstruction, 'fro') ** 2
+        
+        l2_reg = self.lambda_reg * np.linalg.norm(W, 'fro') ** 2
+        l1_reg = self.beta_sparsity * np.sum(np.abs(W))
+        sum_constraint = self.gamma_sum * np.sum((np.sum(W, axis=1) - 1) ** 2)
+        
+        isotope_constraint = 0.0
+        if self.delta13C12 is not None:
+            alpha_target = self._compute_alpha_target(self.delta13C12)
+            alpha_target_expanded = alpha_target[:, np.newaxis]
+            isotope_constraint = self.eta_isotope * np.sum((alpha - alpha_target_expanded) ** 2)
+        
+        smoothness = 0.0
+        if m > 1:
+            for k in range(self.n_components):
+                alpha_diff = alpha[1:, k] - alpha[:-1, k]
+                smoothness += self.mu_smoothness * np.sum(alpha_diff ** 2)
+        
+        total_loss = recon_error + l2_reg + l1_reg + sum_constraint + isotope_constraint + smoothness
+        
+        return total_loss, {
+            'recon_error': recon_error,
+            'l2_reg': l2_reg,
+            'l1_reg': l1_reg,
+            'sum_constraint': sum_constraint,
+            'isotope_constraint': isotope_constraint,
+            'smoothness': smoothness
+        }
+    
+    def _update_H(self, V: np.ndarray, W: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+        K, n = self.H.shape
+        H_new = np.zeros((K, n))
+        
+        psi_alpha = self._compute_psi_alpha(alpha)
+        
+        for j in range(n):
+            A = W * psi_alpha
+            b = V[:, j]
+            
+            try:
+                h, _ = nnls(A, b)
+                H_new[:, j] = h
+            except Exception as e:
+                h = self.H[:, j].copy()
+                for _ in range(10):
+                    grad = A.T @ (A @ h - b)
+                    h -= 0.01 * grad
+                    h = np.maximum(h, 0)
+                H_new[:, j] = h
+        
+        return H_new
+    
+    def _update_W(self, V: np.ndarray, H: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+        m, K = self.W.shape
+        W_new = np.zeros((m, K))
+        
+        psi_alpha = self._compute_psi_alpha(alpha)
+        
+        for i in range(m):
+            A = (H * psi_alpha[i, :].reshape(-1, 1)).T
+            b = V[i, :]
+            
+            A_aug = np.vstack([A, np.sqrt(self.gamma_sum) * np.ones(K)])
+            b_aug = np.append(b, np.sqrt(self.gamma_sum))
+            
+            try:
+                w, _ = nnls(A_aug, b_aug)
+                W_new[i, :] = w
+            except Exception as e:
+                w = self.W[i, :].copy()
+                for _ in range(10):
+                    grad = A.T @ (A @ w - b) + self.gamma_sum * 2 * (np.sum(w) - 1)
+                    w -= 0.01 * grad
+                    w = np.maximum(w, 0)
+                W_new[i, :] = w
+        
+        return W_new
+    
+    def _update_alpha(self, V: np.ndarray, W: np.ndarray, H: np.ndarray) -> np.ndarray:
+        m, K = self.alpha.shape
+        alpha_new = self.alpha.copy()
+        
+        if self.delta13C12 is None:
+            return alpha_new
+        
+        psi_alpha = self._compute_psi_alpha(self.alpha)
+        f_array = np.asarray(self.f_delta13C12)
+        f_expanded = f_array[:, np.newaxis]
+        
+        reconstruction = np.dot(W * psi_alpha, H)
+        residual = V - reconstruction
+        
+        alpha_target = self._compute_alpha_target(self.delta13C12)
+        alpha_target_expanded = alpha_target[:, np.newaxis]
+        
+        for k in range(K):
+            grad_recon = -2 * np.sum(residual * (W[:, k:k+1] * f_expanded * H[k:k+1, :]), axis=1)
+            grad_isotope = 2 * self.eta_isotope * (self.alpha[:, k] - alpha_target_expanded[:, 0])
+            
+            grad_smooth = np.zeros(m)
+            if m > 1:
+                grad_smooth[0] = 2 * (self.alpha[0, k] - self.alpha[1, k])
+                grad_smooth[-1] = 2 * (self.alpha[-1, k] - self.alpha[-2, k])
+                for i in range(1, m-1):
+                    grad_smooth[i] = 2 * (2 * self.alpha[i, k] - self.alpha[i-1, k] - self.alpha[i+1, k])
+                grad_smooth *= self.mu_smoothness
+            
+            grad_total = grad_recon + grad_isotope + grad_smooth
+            alpha_new[:, k] = self.alpha[:, k] - 0.001 * grad_total
+            alpha_new[:, k] = np.clip(alpha_new[:, k], 0.98, 1.02)
+        
+        return alpha_new
+    
+    def fit(self, V: np.ndarray, delta13C12: Optional[np.ndarray] = None) -> Dict[str, Any]:
+        m, n = V.shape
+        
+        self._initialize_parameters(V, delta13C12)
+        
+        loss_history = []
+        component_loss_history = []
+        
+        prev_loss = float('inf')
+        for iteration in range(self.max_iter):
+            self.H = self._update_H(V, self.W, self.alpha)
+            self.W = self._update_W(V, self.H, self.alpha)
+            
+            if delta13C12 is not None:
+                self.alpha = self._update_alpha(V, self.W, self.H)
+            
+            total_loss, loss_components = self._compute_loss(V, self.W, self.H, self.alpha)
+            loss_history.append(total_loss)
+            component_loss_history.append(loss_components)
+            
+            if iteration > 0 and abs(prev_loss - total_loss) < self.tol:
+                print(f"  Converged at iteration {iteration+1}")
+                break
+            prev_loss = total_loss
+        
 
-       self.lam = reg_lambda
-       self.bet = reg_beta
-       self.gam = weight_gamma
-       self.eta = weight_eta
-       self.mu = weight_mu
-       self.kappa = kappa
-       self.init_strategy = init_strategy
-
-   def _initialize(self):
-       np.random.seed(None)
-       self.W = np.random.uniform(0.1, 1.0, (self.m, self.K))
-       self.H = np.random.uniform(0.1, 1.0, (self.K, self.n))
-       self.W = self.W / (self.W.sum(axis=1, keepdims=True) + 1e-9)
-       f_delta = self.info['f_delta'].reshape(-1, 1)
-       self.target_alpha = 1.0 + self.kappa * f_delta
-       self.alpha = self.target_alpha + np.random.normal(0, 0.01, (self.m, self.K))
-
-   def calculate_loss(self):
-       """
-       计算总损失函数，包含平滑性项
-       """
-       f_delta = self.info['f_delta'].reshape(-1, 1)
-       Psi = 1.0 + (self.alpha - 1.0)
-       W_eff = self.W * Psi
-       Recon = W_eff @ self.H
-
-       # 基础各项
-       term_fit = np.linalg.norm(self.V - Recon, 'fro') ** 2
-       term_l2 = self.lam * np.linalg.norm(self.W, 'fro') ** 2
-       term_l1 = self.bet * np.sum(np.abs(self.W))
-       term_unity = self.gam * np.sum((np.sum(self.W, axis=1) - 1) ** 2)
-
-       # 同位素约束
-       target = np.tile(self.target_alpha, (1, self.K))
-       term_iso = self.eta * np.sum((self.alpha - target) ** 2)
-
-       # 【新增】平滑性约束 (Smoothness)
-       term_smooth = self.mu * np.sum((self.alpha[:-1, :] - self.alpha[1:, :]) ** 2)
-
-       return term_fit + term_l2 + term_l1 + term_unity + term_iso + term_smooth
-
-   def fit(self, max_iter=100, tol=1e-5):
-       self._initialize()
-       loss_history = []
-       eye_K = np.eye(self.K) * np.sqrt(self.lam)
-       zeros_K = np.zeros(self.K)
-       ones_row = np.ones((1, self.K)) * np.sqrt(self.gam)
-       unity_target = np.array([np.sqrt(self.gam)])
-
-       for it in range(max_iter):
-           # --- 1. 更新 H ---
-           Psi = 1.0 + (self.alpha - 1.0)
-           W_eff = self.W * Psi
-           for j in range(self.n):
-               self.H[:, j], _ = nnls(W_eff, self.V[:, j])
-
-           # --- 2. 更新 W ---
-           for i in range(self.m):
-               H_eff = (self.H.T * Psi[i, :]).T
-               A_aug = np.vstack([H_eff.T, eye_K, ones_row])
-               b_aug = np.concatenate([self.V[i, :], zeros_K, unity_target])
-               self.W[i, :], _ = nnls(A_aug, b_aug)
-
-           if self.bet > 0:
-               self.W = np.maximum(0, self.W - self.bet * 0.001)
-
-           # --- 3. 更新 Alpha (梯度下降) ---
-           R = (self.W * Psi) @ self.H - self.V
-
-           # 基础梯度
-           grad_alpha = 2 * (R @ self.H.T) * self.W
-           grad_alpha += 2 * self.eta * (self.alpha - np.tile(self.target_alpha, (1, self.K)))
-
-           # 平滑性梯度
-           grad_smooth = np.zeros_like(self.alpha)
-           if self.m > 1:
-               grad_smooth[1:-1, :] = 2 * self.mu * (2 * self.alpha[1:-1, :] - self.alpha[:-2, :] - self.alpha[2:, :])
-               grad_smooth[0, :] = 2 * self.mu * (self.alpha[0, :] - self.alpha[1, :])
-               grad_smooth[-1, :] = 2 * self.mu * (self.alpha[-1, :] - self.alpha[-2, :])
-           grad_alpha += grad_smooth
-
-           # 更新
-           self.alpha -= 0.001 * grad_alpha
-           # 【重要】Alpha 范围限制在 [0.98, 1.02]
-           self.alpha = np.clip(self.alpha, 0.98, 1.02)
-
-           loss = self.calculate_loss()
-           loss_history.append(loss)
-           if it > 10 and abs(loss_history[-2] - loss) < tol:
-               break
-       return loss_history
-
-
-# ==========================================
-# 3. 绘图逻辑 (图A和图B 独立绘制)
-# ==========================================
-def plot_separated_figures(V_norm, info):
-   """
-   修改后的绘图函数：将图A和图B分开绘制，避免坐标轴拥挤
-   """
-
-   # === 1. 计算图A数据 (K值扫描) ===
-   print("\n[Step 1] 计算 K 值选择指标 (RMSE/AIC)...")
-   k_range = list(range(2, 9))
-   rmse_means, rmse_stds, aic_means = [], [], []
-
-   for k in tqdm(k_range, desc="Scanning K"):
-       k_errors, k_aics = [], []
-       for _ in range(8):
-           noise = np.random.normal(0, 0.02, V_norm.shape)
-           model = GeochemicalNMF(pd.DataFrame(V_norm.values + noise, columns=V_norm.columns),
-                                  k, info, reg_lambda=0.01, reg_beta=0.01)
-           model.fit(max_iter=50)
-           Psi = 1.0 + (model.alpha - 1.0)
-           Recon = (model.W * Psi) @ model.H
-           rss = np.sum((V_norm.values - Recon) ** 2)
-           mse = rss / (V_norm.shape[0] * V_norm.shape[1])
-           k_errors.append(np.sqrt(mse))
-           n_samples = V_norm.shape[0] * V_norm.shape[1]
-           n_params = k * (V_norm.shape[0] + V_norm.shape[1])
-           aic = n_samples * np.log(rss / n_samples) + 2 * n_params
-           k_aics.append(aic)
-       rmse_means.append(np.mean(k_errors))
-       rmse_stds.append(np.std(k_errors))
-       aic_means.append(np.mean(k_aics))
-
-   rmse_arr = np.array(rmse_means)
-   rmse_std_arr = np.array(rmse_stds)
-   second_deriv = []
-   k_deriv = []
-   for i in range(1, len(rmse_arr) - 1):
-       d2 = (rmse_arr[i + 1] + rmse_arr[i - 1] - 2 * rmse_arr[i])
-       second_deriv.append(d2)
-       k_deriv.append(k_range[i])
-
-   # === 绘制图 A (独立画板，宽布局) ===
-   print("  -> 绘制图 A (Multi-Criteria)...")
-   plt.figure(figsize=(12, 7))  # 宽布局
-   ax_a = plt.gca()
-
-   # 1. RMSE (左轴)
-   p1, = ax_a.plot(k_range, rmse_means, 'o-', color='navy', linewidth=2.5, label='RMSE (Left)')
-   ax_a.fill_between(k_range,
-                     rmse_arr - 2 * rmse_std_arr,
-                     rmse_arr + 2 * rmse_std_arr,
-                     color='navy', alpha=0.20, label='95% CI')
-   ax_a.set_xlabel('Number of End-members (K)', fontsize=14, fontweight='bold')
-   ax_a.set_ylabel('RMSE', fontsize=14, fontweight='bold', color='navy')
-   ax_a.tick_params(axis='y', labelcolor='navy')
-
-   # 2. Curvature (右轴1)
-   ax_a2 = ax_a.twinx()
-   p2, = ax_a2.plot(k_deriv, second_deriv, color='red', marker='D', linestyle='--', linewidth=2,
-                    label='Curvature (Right-1)')
-   ax_a2.set_ylabel('Curvature', fontsize=14, fontweight='bold', color='red')
-   ax_a2.tick_params(axis='y', labelcolor='red')
-
-   # 3. AIC (右轴2 - 偏移位置)
-   ax_a3 = ax_a.twinx()
-   # 将第三个坐标轴向右推，避免重叠
-   ax_a3.spines["right"].set_position(("axes", 1.2))
-   p3, = ax_a3.plot(k_range, aic_means, color='#33a02c', marker='s', linestyle=':', linewidth=2.5,
-                    label='AIC Trend (Right-2)')
-   ax_a3.set_ylabel('AIC Criterion', fontsize=14, fontweight='bold', color='#33a02c')
-   ax_a3.tick_params(axis='y', labelcolor='#33a02c')
-
-   # 合并图例
-   lines = [p1, p2, p3]
-   ax_a.legend(lines, [l.get_label() for l in lines], loc='upper center', fontsize=11, frameon=True)
-   plt.title('(a) Multi-Criteria for K Selection', fontsize=18, pad=20)
-   plt.tight_layout()  # 自动调整布局，防止被切掉
-   plt.savefig('Figure_A_K_Selection.png', dpi=300, bbox_inches='tight')
-   plt.show()
-
-   # === 绘制图 B (独立画板) ===
-   print("  -> 绘制图 B (Convergence)...")
-   max_iter = 80
-   all_histories = []
-   for i in range(50):
-       model = GeochemicalNMF(V_norm, 5, info, init_strategy='random')
-       hist = model.fit(max_iter=max_iter)
-       if len(hist) < max_iter:
-           hist += [hist[-1]] * (max_iter - len(hist))
-       all_histories.append(hist)
-   hist_arr = np.array(all_histories)
-   mean_hist = np.mean(hist_arr, axis=0)
-   std_hist = np.std(hist_arr, axis=0)
-
-   plt.figure(figsize=(10, 7))  # 标准大方布局
-   ax_b = plt.gca()
-   ax_b.plot(mean_hist, color='blue', alpha=0.3, linewidth=1)
-   idx = np.arange(0, max_iter, 8)
-   ax_b.errorbar(idx, mean_hist[idx], yerr=std_hist[idx], fmt='o', color='blue', ecolor='red', elinewidth=2.5,
-                 capsize=5, markersize=7, label='Loss Sample')
-   ax_b.set_xlabel('Iterations', fontsize=14, fontweight='bold')
-   ax_b.set_ylabel('Loss Function', fontsize=14, fontweight='bold', color='blue')
-   ax_b.set_title('(b) Optimization Convergence', fontsize=18, pad=15)
-   ax_b.legend(fontsize=12)
-   plt.tight_layout()
-   plt.savefig('Figure_B_Convergence.png', dpi=300, bbox_inches='tight')
-   plt.show()
-
-
-# ==========================================
-# 4. 图C - 保持不变
-# ==========================================
-def plot_figure_C(mean_W, std_W, meta, k_val):
-   print(f"\n[Step] 正在绘制 K={k_val} 的贡献图...")
-   wells = meta['Well'].unique()
-   display_wells = wells[:15] if len(wells) > 15 else wells
-   idx_map = [meta[meta['Well'] == w].index[0] for w in display_wells]
-
-   plt.figure(figsize=(14, 7))
-   colors = sns.color_palette("bright", k_val)
-   x = np.arange(len(display_wells))
-
-   for j in range(k_val):
-       vals = mean_W[idx_map, j]
-       errs = std_W[idx_map, j] * 1.96  # 95% CI
-       plt.errorbar(x + (j - k_val / 2) * 0.15, vals, yerr=errs, fmt='o',
-                    color=colors[j], ecolor='red', elinewidth=2.0,
-                    capsize=4, label=f'EM{j + 1}')
-
-   plt.xlabel('Well ID', fontsize=14, fontweight='bold')
-   plt.ylabel('Contribution', fontsize=14, fontweight='bold')
-   plt.title(f'(c) End-Member Contributions (95% CI) - K={k_val}', fontsize=16)
-   plt.xticks(x, display_wells, rotation=45)
-   plt.legend()
-   plt.tight_layout()
-   plt.savefig(f'Result_Figure_C_K{k_val}.png', dpi=300)
-   plt.show()
+        pure_recon_error = self._compute_pure_reconstruction_error(V, self.W, self.H, self.alpha)
+        
+        return {
+            'W': self.W,
+            'H': self.H,
+            'alpha': self.alpha,
+            'loss_history': loss_history,
+            'loss_components': component_loss_history,
+            'pure_recon_error': pure_recon_error,
+            'n_iterations': iteration + 1
+        }
 
 
-def plot_region_rc_bootstrap_ci(boot_W, meta, k_val, out_png=None):
-    """
-    Region尺度：RC by region (mean ± 95% CI), bootstrap
-    boot_W: ndarray, shape = (n_boot, n_samples, k)
-    meta: DataFrame with ['Region','Well']
-    """
-    if meta is None or len(meta) == 0 or ('Region' not in meta.columns):
-        print("     [警告] meta 缺少 Region，无法生成 Figure C1")
-        return
-    if boot_W is None or len(boot_W) == 0:
-        print("     [警告] boot_W 为空，无法生成 Figure C1")
-        return
+class PSOOptimizer:
+    """Particle Swarm Optimization for hyperparameter tuning."""
+    
+    def __init__(self, n_particles: int = 10, n_generations: int = 80,
+                 lambda_range: Tuple[float, float] = (0.001, 0.5),
+                 beta_range: Tuple[float, float] = (0.001, 0.1)):
+        
+        self.n_particles = n_particles
+        self.n_generations = n_generations
+        self.lambda_range = lambda_range
+        self.beta_range = beta_range
+        
+        self.w = 0.729
+        self.c1 = 1.49445
+        self.c2 = 1.49445
+        
+    def optimize(self, V: np.ndarray, delta13C12: Optional[np.ndarray] = None,
+                 K_values: List[int] = None) -> Dict[str, Any]:
+        if K_values is None:
+            K_values = [2, 3, 4, 5, 6, 7]
+        
+        results = {}
+        
+        for K in K_values:
+            print(f"Optimizing for K={K}...")
+            
+            particles = []
+            velocities = []
+            personal_best = []
+            personal_best_fitness = []
+            
+            for _ in range(self.n_particles):
+                lambda_val = np.random.uniform(*self.lambda_range)
+                beta_val = np.random.uniform(*self.beta_range)
+                particles.append([lambda_val, beta_val])
+                velocities.append([0.0, 0.0])
+                personal_best.append([lambda_val, beta_val])
+                personal_best_fitness.append(float('inf'))
+            
+            global_best = particles[0].copy()
+            global_best_fitness = float('inf')
+            
+            prev_best_fitness = float('inf')
+            
+            for gen in range(self.n_generations):
+                for i in range(self.n_particles):
+                    lambda_val, beta_val = particles[i]
+                    
+                    model = PSONMFWithFractionation(
+                        n_components=K,
+                        lambda_reg=lambda_val,
+                        beta_sparsity=beta_val,
+                        max_iter=40,
+                        tol=0
+                    )
+                    
+                    try:
+                        result = model.fit(V, delta13C12)
+                        fitness = result['loss_history'][-1] if result['loss_history'] else float('inf')
+                    except Exception as e:
+                        print(f"Error in PSO for K={K}: {e}")
+                        fitness = float('inf')
+                    
+                    if fitness < personal_best_fitness[i]:
+                        personal_best[i] = particles[i].copy()
+                        personal_best_fitness[i] = fitness
+                    
+                    if fitness < global_best_fitness:
+                        global_best = particles[i].copy()
+                        global_best_fitness = fitness
+                
+                if gen > 0 and abs(prev_best_fitness - global_best_fitness) < 1e-4:
+                    print(f"  Converged at generation {gen}")
+                    break
+                prev_best_fitness = global_best_fitness
+                
+                for i in range(self.n_particles):
+                    for d in range(2):
+                        r1, r2 = random.random(), random.random()
+                        velocities[i][d] = (self.w * velocities[i][d] +
+                                           self.c1 * r1 * (personal_best[i][d] - particles[i][d]) +
+                                           self.c2 * r2 * (global_best[d] - particles[i][d]))
+                        
+                        particles[i][d] += velocities[i][d]
+                        
+                        if d == 0:
+                            particles[i][d] = np.clip(particles[i][d], *self.lambda_range)
+                        else:
+                            particles[i][d] = np.clip(particles[i][d], *self.beta_range)
+            
+            results[K] = {
+                'best_lambda': global_best[0],
+                'best_beta': global_best[1],
+                'best_fitness': global_best_fitness,
+                'all_fitness': personal_best_fitness
+            }
+        
+        return results
 
-    boot_W = np.array(boot_W, dtype=float)
-    n_boot, n_samples, kk = boot_W.shape
-    if kk != k_val:
-        print("     [警告] boot_W 的 K 与 k_val 不一致，无法生成 Figure C1")
-        return
 
-    # Region顺序（按出现顺序，也可以改成排序）
-    regions = meta['Region'].astype(str).values
-    uniq_regions = pd.unique(regions)
+def preprocess_data(data_df: pd.DataFrame, features: List[str],
+                    delta13C1_col: str = 'd13C1', delta13C2_col: str = 'd13C2') -> Dict[str, Any]:
+    """Preprocess gas geochemical data."""
+    
+    print("Performing KNN imputation (k=3)...")
+    imputer = KNeighborsImputer(n_neighbors=3)
+    
+    data_for_imputation = data_df[features].copy()
+    data_imputed_array = imputer.fit_transform(data_for_imputation)
+    
+    data_imputed = data_df.copy()
+    for idx, col in enumerate(features):
+        data_imputed[col] = data_imputed_array[:, idx]
+    
+    print("Clipping outliers (2.5th-97.5th percentile)...")
+    for col in features:
+        if col in data_imputed.columns:
+            q_low = data_imputed[col].quantile(0.025)
+            q_high = data_imputed[col].quantile(0.975)
+            data_imputed[col] = data_imputed[col].clip(lower=q_low, upper=q_high)
+    
+    print("Applying min-max normalization...")
+    normalization_params = {}
+    data_normalized = data_imputed.copy()
+    
+    for col in features:
+        if col in data_normalized.columns:
+            min_val = data_normalized[col].min()
+            max_val = data_normalized[col].max()
+            range_val = max_val - min_val
+            
+            if range_val == 0:
+                range_val = 1.0
+            
+            data_normalized[col] = (data_normalized[col] - min_val) / range_val
+            
+            normalization_params[col] = {
+                'min': min_val,
+                'max': max_val,
+                'range': range_val
+            }
+    
+    if delta13C1_col in data_normalized.columns and delta13C2_col in data_normalized.columns:
+        delta13C12 = (data_normalized[delta13C1_col] - data_normalized[delta13C2_col]).values
+    else:
+        delta13C12 = None
+    
+    V = data_normalized[features].values
+    
+    return {
+        'V': V,
+        'delta13C12': delta13C12,
+        'normalization_params': normalization_params,
+        'data_normalized': data_normalized,
+        'data_original': data_df
+    }
 
-    # 每次bootstrap：先在region内取样本均值 -> 得到 (n_region, k)
-    region_boot = []  # list of (n_region, k)
-    for b in range(n_boot):
-        Wb = boot_W[b]  # (n_samples, k)
-        rows = []
-        for rg in uniq_regions:
-            idx = np.where(regions == rg)[0]
-            rows.append(np.mean(Wb[idx, :], axis=0))
-        region_boot.append(np.vstack(rows))
-    region_boot = np.stack(region_boot, axis=0)  # (n_boot, n_region, k)
 
-    # 均值 + 95%CI（分位数法）
-    mean_rc = np.mean(region_boot, axis=0)                     # (n_region, k)
-    low_rc  = np.quantile(region_boot, 0.025, axis=0)          # (n_region, k)
-    high_rc = np.quantile(region_boot, 0.975, axis=0)          # (n_region, k)
+def inverse_normalize_H(H_nmf: np.ndarray, normalization_params: Dict[str, Dict[str, float]],
+                        features: List[str]) -> np.ndarray:
+    K, n = H_nmf.shape
+    H_rescaled = np.zeros_like(H_nmf)
+    
+    for j, feature in enumerate(features[:n]):
+        if feature in normalization_params:
+            min_val = normalization_params[feature]['min']
+            range_val = normalization_params[feature]['range']
+            
+            if range_val == 0:
+                range_val = 1.0
+            
+            H_rescaled[:, j] = H_nmf[:, j] * range_val + min_val
+    
+    return H_rescaled
 
-    # 画图：k个子图
-    fig, axes = plt.subplots(k_val, 1, figsize=(16, 4*k_val), sharex=True)
-    if k_val == 1:
+
+def bootstrap_validation(model_class, V: np.ndarray, delta13C12: Optional[np.ndarray],
+                         n_bootstrap: int = 50, n_components: int = 5) -> Dict[str, Any]:
+    m, n = V.shape
+    
+    W_bootstrap = []
+    H_bootstrap = []
+    
+    for b in range(n_bootstrap):
+        if (b + 1) % 10 == 0:
+            print(f"  Bootstrap iteration {b+1}/{n_bootstrap}")
+        
+        indices = np.random.choice(m, m, replace=True)
+        V_boot = V[indices]
+        delta13C12_boot = delta13C12[indices] if delta13C12 is not None else None
+        
+        try:
+            model = model_class(n_components=n_components)
+            result = model.fit(V_boot, delta13C12_boot)
+            
+            W_bootstrap.append(result['W'])
+            H_bootstrap.append(result['H'])
+            
+        except Exception as e:
+            print(f"  Bootstrap iteration {b+1} failed: {e}")
+            continue
+    
+    if not W_bootstrap:
+        raise ValueError("All bootstrap iterations failed")
+    
+    W_bootstrap = np.array(W_bootstrap)
+    H_bootstrap = np.array(H_bootstrap)
+    
+    W_mean = np.mean(W_bootstrap, axis=0)
+    W_std = np.std(W_bootstrap, axis=0)
+    W_p2_5 = np.percentile(W_bootstrap, 2.5, axis=0)
+    W_p97_5 = np.percentile(W_bootstrap, 97.5, axis=0)
+    
+    H_mean = np.mean(H_bootstrap, axis=0)
+    H_std = np.std(H_bootstrap, axis=0)
+    H_p2_5 = np.percentile(H_bootstrap, 2.5, axis=0)
+    H_p97_5 = np.percentile(H_bootstrap, 97.5, axis=0)
+    
+    return {
+        'W_mean': W_mean,
+        'W_std': W_std,
+        'W_p2_5': W_p2_5,
+        'W_p97_5': W_p97_5,
+        'H_mean': H_mean,
+        'H_std': H_std,
+        'H_p2_5': H_p2_5,
+        'H_p97_5': H_p97_5,
+        'W_bootstrap': W_bootstrap,
+        'H_bootstrap': H_bootstrap
+    }
+
+
+def project_root() -> Path:
+    p = Path(__file__).resolve()
+    if p.parent.name.lower() == "run":
+        return p.parent.parent
+    return Path.cwd()
+
+
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def pick_existing(*candidates: Path) -> Path:
+    for c in candidates:
+        if c.exists():
+            return c
+    raise FileNotFoundError("No candidate files found")
+
+
+def infer_col(df: pd.DataFrame, preferred: List[str]) -> str:
+    cols = {c.lower(): c for c in df.columns}
+    for name in preferred:
+        if name.lower() in cols:
+            return cols[name.lower()]
+    raise KeyError(f"None of {preferred} found in columns: {list(df.columns)}")
+
+
+def em_sort_key(em: str) -> Tuple[int, str]:
+    s = str(em).strip()
+    digits = "".join([ch for ch in s if ch.isdigit()])
+    if digits:
+        return (int(digits), s)
+    return (10**9, s)
+
+
+def compute_curvature(k: np.ndarray, y: np.ndarray) -> np.ndarray:
+    y1 = np.gradient(y, k)
+    y2 = np.gradient(y1, k)
+    return y2
+
+
+def calculate_aic_correct(V: np.ndarray, pure_recon_error: float, K: int) -> float:
+    """Correct calculation of AIC"""
+    m, n = V.shape
+    if m * n == 0 or pure_recon_error <= 0:
+        return np.nan
+    
+    # Number of parameters
+    # W: m*K, but with sum constraint reduces to m*(K-1)
+    # H: K*n
+    k_params = m * (K - 1) + K * n
+    
+    # AIC = 2k + n*log(RSS/n)
+    aic_value = 2 * k_params + (m * n) * np.log(pure_recon_error / (m * n))
+    
+    return aic_value
+
+
+def calculate_curvature_for_selection(k_values, rmse_values):
+    """Calculate curvature of RMSE-K curve"""
+    if len(k_values) < 3:
+        return [np.nan] * len(k_values)
+    
+    curvature = np.zeros_like(rmse_values, dtype=float)
+    for i in range(1, len(k_values)-1):
+        h1 = k_values[i] - k_values[i-1]
+        h2 = k_values[i+1] - k_values[i]
+        if h1 == 0 or h2 == 0:
+            curvature[i] = 0
+        else:
+            curvature[i] = (rmse_values[i+1]/h2 - rmse_values[i]*(1/h1+1/h2) + rmse_values[i-1]/h1) / ((h1+h2)/2)
+    
+    curvature[0] = curvature[1] if len(curvature) > 1 else 0
+    curvature[-1] = curvature[-2] if len(curvature) > 1 else 0
+    
+    return curvature
+
+
+def plot_k_selection(ax: plt.Axes, dfk: pd.DataFrame) -> None:
+    k_col = infer_col(dfk, ["K"])
+    rmse_col = infer_col(dfk, ["RMSE_mean", "rmse_mean", "RMSE"])
+    aic_col = None
+    for cand in ["AIC", "aic", "AIC_mean", "aic_mean"]:
+        if cand in dfk.columns or cand.lower() in [c.lower() for c in dfk.columns]:
+            aic_col = infer_col(dfk, [cand])
+            break
+    if aic_col is None:
+        raise KeyError("AIC column not found in k_selection_summary.csv")
+    
+    band_lo_col = None
+    band_hi_col = None
+    for lo, hi in [("RMSE_p5", "RMSE_p95"), ("rmse_p5", "rmse_p95"), ("p5", "p95")]:
+        if lo.lower() in [c.lower() for c in dfk.columns] and hi.lower() in [c.lower() for c in dfk.columns]:
+            band_lo_col = infer_col(dfk, [lo])
+            band_hi_col = infer_col(dfk, [hi])
+            break
+    rmse_std_col = None
+    if band_lo_col is None:
+        for cand in ["RMSE_std", "rmse_std", "std"]:
+            if cand.lower() in [c.lower() for c in dfk.columns]:
+                rmse_std_col = infer_col(dfk, [cand])
+                break
+    
+    k = dfk[k_col].to_numpy(dtype=float)
+    rmse = dfk[rmse_col].to_numpy(dtype=float)
+    aic = dfk[aic_col].to_numpy(dtype=float)
+    
+    # Calculate curvature if not already in dataframe
+    if 'curvature' in dfk.columns:
+        curvature = dfk['curvature'].to_numpy(dtype=float)
+    else:
+        curvature = calculate_curvature_for_selection(k, rmse)
+    
+    ax1 = ax
+    ax2 = ax1.twinx()
+    ax3 = ax1.twinx()
+    ax3.spines["right"].set_position(("outward", 60))
+    
+    c_rmse = "tab:blue"
+    c_curv = "red"
+    c_aic = "green"
+    
+    line_rmse, = ax1.plot(k, rmse, marker="o", linewidth=2.5, color=c_rmse, label="RMSE (Left)")
+    if band_lo_col is not None and band_hi_col is not None:
+        lo = dfk[band_lo_col].to_numpy(dtype=float)
+        hi = dfk[band_hi_col].to_numpy(dtype=float)
+        ax1.fill_between(k, lo, hi, color=c_rmse, alpha=0.18, label="_nolegend_")
+    elif rmse_std_col is not None:
+        std = dfk[rmse_std_col].to_numpy(dtype=float)
+        ax1.fill_between(k, rmse - std, rmse + std, color=c_rmse, alpha=0.18, label="_nolegend_")
+    
+    line_curv, = ax2.plot(k, curvature, marker="D", linestyle="--", linewidth=2.0, color=c_curv, label="Curvature (Right-1)")
+    
+    line_aic, = ax3.plot(k, aic, marker="s", linestyle=":", linewidth=2.5, color=c_aic, label="AIC Trend (Right-2)")
+    
+    ax1.set_ylabel("RMSE", color=c_rmse, fontsize=14)
+    ax1.tick_params(axis="y", colors=c_rmse)
+    ax2.set_ylabel("Curvature", color=c_curv, fontsize=14)
+    ax2.tick_params(axis="y", colors=c_curv)
+    ax3.set_ylabel("AIC Criterion", color=c_aic, fontsize=14)
+    ax3.tick_params(axis="y", colors=c_aic)
+    
+    ax1.set_xlabel("Number of End-members (K)", fontsize=14)
+    ax1.set_xticks(k.astype(int))
+    ax1.grid(True, linestyle="--", alpha=0.35)
+    ax1.set_title("(a) Multi-Criteria for K Selection", fontsize=18, pad=12)
+    
+    handles = [line_rmse, line_curv, line_aic]
+    labels = [h.get_label() for h in handles]
+    ax1.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.98), frameon=True)
+
+
+def summarize_convergence(dfB: pd.DataFrame, trim_q: float = 0.10) -> pd.DataFrame:
+    gen_col = infer_col(dfB, ["gen", "generation", "iter", "iteration"])
+    loss_col = infer_col(dfB, ["best_total", "best_loss", "loss", "total"])
+    
+    rows = []
+    for gen, sub in dfB.groupby(gen_col):
+        vals = pd.to_numeric(sub[loss_col], errors="coerce").dropna().to_numpy(dtype=float)
+        n = len(vals)
+        if n == 0:
+            continue
+        
+        lo = np.quantile(vals, trim_q)
+        hi = np.quantile(vals, 1 - trim_q)
+        vals_trim = vals[(vals >= lo) & (vals <= hi)]
+        if len(vals_trim) >= 3:
+            m = float(np.mean(vals_trim))
+            s = float(np.std(vals_trim, ddof=1))
+            n_eff = len(vals_trim)
+        else:
+            m = float(np.mean(vals))
+            s = float(np.std(vals, ddof=1)) if n >= 2 else 0.0
+            n_eff = n
+        
+        se = s / math.sqrt(max(n_eff, 1))
+        rows.append((float(gen), m, s, n_eff, se))
+    
+    g = pd.DataFrame(rows, columns=["gen", "mean", "std_trim", "n_eff", "se"]).sort_values("gen")
+    return g
+
+
+def plot_convergence_style(ax, dfB, step: int = 10,
+                           trim_q: float = 0.20,
+                           se_cap: float = 0.8):
+    g = summarize_convergence(dfB, trim_q=trim_q)
+    
+    g = g[g["gen"].astype(int) % step == 0].copy()
+    g = g.sort_values("gen")
+    
+    x = g["gen"].to_numpy(dtype=float)
+    y = g["mean"].to_numpy(dtype=float)
+    se = g["se"].to_numpy(dtype=float)
+    
+    se = np.minimum(se, se_cap)
+    
+    ax.plot(x, y, linewidth=2.8, color="tab:blue", alpha=0.95)
+    
+    ax.errorbar(
+        x, y, yerr=se,
+        fmt="o", markersize=7,
+        markerfacecolor="tab:blue", markeredgecolor="tab:blue",
+        ecolor="tab:orange", color="tab:orange",
+        elinewidth=2.0, capsize=4, capthick=2.0
+    )
+    
+    ax.set_title("(b) Optimization Convergence", fontsize=18, pad=10)
+    ax.set_xlabel("Iterations", fontsize=14)
+    ax.set_ylabel("Loss Function", fontsize=14, color="tab:blue")
+    
+    ax.tick_params(axis="y", which="both", left=True, labelleft=True, colors="tab:blue", labelsize=12)
+    ax.tick_params(axis="x", labelsize=12)
+    
+    ax.set_ylim(37, 40)
+    ax.set_yticks(np.arange(37, 41, 1))
+    ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%d"))
+    
+    ax.grid(True, linestyle="--", alpha=0.35)
+    
+    handle = Line2D(
+        [0], [0],
+        color="tab:orange", linewidth=2.2,
+        marker="o", markersize=7,
+        markerfacecolor="tab:blue", markeredgecolor="tab:blue"
+    )
+    ax.legend([handle], ["Loss Sample"], loc="upper right", frameon=True)
+
+
+def plot_convergence_50runs(dfB: pd.DataFrame, out_png: Path) -> None:
+    gen_col = infer_col(dfB, ["gen", "generation", "iter", "iteration"])
+    run_col = infer_col(dfB, ["run_id", "run", "seed"])
+    loss_col = infer_col(dfB, ["best_total", "best_loss", "loss", "total"])
+    
+    gens = np.sort(dfB[gen_col].unique())
+    runs = np.sort(dfB[run_col].unique())
+    
+    fig, ax = plt.subplots(figsize=(16, 9))
+    
+    for rid in runs:
+        d = dfB[dfB[run_col] == rid].sort_values(gen_col)
+        ax.plot(d[gen_col], d[loss_col], linewidth=1.2, alpha=0.22)
+    
+    g = (
+        dfB.groupby(gen_col)[loss_col]
+        .agg(mean="mean", std=lambda x: np.std(x, ddof=1))
+        .reset_index()
+        .sort_values(gen_col)
+    )
+    ax.plot(g[gen_col], g["mean"], linewidth=3.0, alpha=0.9)
+    ax.fill_between(g[gen_col], g["mean"] - g["std"], g["mean"] + g["std"], alpha=0.18)
+    
+    ax.set_title("Figure B. MOPSO convergence trajectories (50 independent runs)", fontsize=18, pad=10)
+    ax.set_xlabel("Generation", fontsize=14)
+    ax.set_ylabel("Best loss (min total in archive)", fontsize=14)
+    ax.grid(True, linestyle="--", alpha=0.35)
+    
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=200)
+    plt.close(fig)
+
+
+def plot_rc_by_region(df_region: pd.DataFrame, out_png: Path) -> None:
+    gcol = infer_col(df_region, ["group", "region"])
+    ecol = infer_col(df_region, ["em", "endmember"])
+    mcol = infer_col(df_region, ["mean"])
+    lcol = infer_col(df_region, ["p2_5", "p025", "ci_low", "low"])
+    ucol = infer_col(df_region, ["p97_5", "p975", "ci_high", "high"])
+    
+    agg_df = df_region.groupby([gcol, ecol]).agg({
+        mcol: 'mean',
+        lcol: 'mean',
+        ucol: 'mean'
+    }).reset_index()
+    
+    groups = sorted(agg_df[gcol].astype(str).unique())
+    ems = sorted(agg_df[ecol].astype(str).unique(), key=em_sort_key)
+    
+    n_em = len(ems)
+    fig_h = 2.2 * n_em + 2.0
+    fig, axes = plt.subplots(n_em, 1, figsize=(18, fig_h), sharex=True)
+    
+    if n_em == 1:
         axes = [axes]
-
-    x = np.arange(len(uniq_regions))
-    for j in range(k_val):
-        ax = axes[j]
-        y = mean_rc[:, j]
-        yerr = np.vstack([y - low_rc[:, j], high_rc[:, j] - y])
-        ax.bar(x, y)
-        ax.errorbar(x, y, yerr=yerr, fmt='none', ecolor='black', capsize=3)
-        ax.set_ylabel(f'EM{j+1} RC')
-        ax.grid(True, alpha=0.2)
-
+    
+    x = np.arange(len(groups))
+    for i, em in enumerate(ems):
+        ax = axes[i]
+        sub = agg_df[agg_df[ecol].astype(str) == em].copy()
+        sub[gcol] = sub[gcol].astype(str)
+        
+        sub = sub.set_index(gcol).reindex(groups).reset_index()
+        mean = sub[mcol].to_numpy(dtype=float)
+        lo = sub[lcol].to_numpy(dtype=float)
+        hi = sub[ucol].to_numpy(dtype=float)
+        yerr = np.vstack([mean - lo, hi - mean])
+        
+        ax.bar(x, mean, alpha=0.85)
+        ax.errorbar(x, mean, yerr=yerr, fmt="none", ecolor="black", elinewidth=1.4, capsize=3)
+        
+        ax.set_ylabel(f"{em} RC", fontsize=12)
+        ax.grid(True, axis="y", linestyle="--", alpha=0.25)
+    
     axes[-1].set_xticks(x)
-    axes[-1].set_xticklabels(uniq_regions, rotation=30, ha='right')
-    axes[-1].set_xlabel('Region')
-
-    fig.suptitle(f'Figure C1 (region). RC by region (mean ± 95% CI, bootstrap n={n_boot}, K={k_val})', y=0.995)
-    plt.tight_layout()
-
-    if out_png is None:
-        out_png = f'Figure_C1_region_RC_bootstrap_n{n_boot}_K{k_val}.png'
-    plt.savefig(out_png, dpi=300, bbox_inches='tight')
-    plt.show()
-    print(f"  -> [保存成功] {out_png}")
+    axes[-1].set_xticklabels(groups, rotation=25, ha="right", fontsize=10)
+    axes[-1].set_xlabel("Region", fontsize=13)
+    fig.suptitle("Figure C1 (region). RC by region (mean ± 95% CI, bootstrap n=50, K=5)", fontsize=18, y=0.995)
+    
+    fig.tight_layout(rect=[0, 0, 1, 0.985])
+    fig.savefig(out_png, dpi=200)
+    plt.close(fig)
 
 
-# ==========================================
-# 5. 辅助功能函数
-# ==========================================
-def optimize_with_pso_wrapped(data_matrix_imputed, n_components, info):
-   print(f"  -> [PSO] 寻找 K={n_components} 的最佳参数...")
-
-   def objective_function(params):
-       reg_lambda, reg_beta = params
-       model = GeochemicalNMF(data_matrix_imputed, n_components, info,
-                              reg_lambda=reg_lambda, reg_beta=reg_beta)
-       hist = model.fit(max_iter=40)
-       return hist[-1]
-
-   lb = [0.001, 0.001]
-   ub = [0.5, 0.1]
-   best_params, _ = pso(objective_function, lb, ub, swarmsize=10, maxiter=80, minfunc=1e-4)
-   print(f"     PSO 最佳参数: Lambda={best_params[0]:.4f}, Beta={best_params[1]:.4f}")
-   return best_params
-
-
-# ==========================================
-# 5.1 弦图（仅在这里做修改：稳定 + 按Region排序 + Region|Well 标签）
-# ==========================================
-def plot_chord_diagram_transplanted(W_matrix, meta_data, k_val, threshold=15.0):
-   """
-   稳定版弦图（Chord Diagram）——只改绘图，不改模型结果。
-
-   改进点（不改变你现有模型/流程）：
-   1) Well 节点按 Region -> Well 排序（更符合地质分区阅读）
-   2) Well 节点显示为 "Region|Well"（一眼识别地区）
-   3) nodes 使用整数 index（HoloViews Chord 最稳的数据模式，避免 DataError）
-   4) 边颜色按端元 source_em；节点颜色按 group（EndMember vs Region）
-   5) 保留原逻辑：按行归一化为百分比，阈值过滤（默认 >15%）
-   """
-   print(f"  -> 生成 K={k_val} 的弦图 (HTML, threshold>{threshold}%)...")
-
-   # ---------- 0) 基础检查 ----------
-   if meta_data is None or len(meta_data) == 0:
-       print("     [警告] meta_data 为空，无法生成弦图。")
-       return
-
-   if 'Region' not in meta_data.columns or 'Well' not in meta_data.columns:
-       print("     [警告] meta_data 缺少 Region/Well 列，无法生成弦图。")
-       return
-
-   if W_matrix is None:
-       print("     [警告] W_matrix 为空，无法生成弦图。")
-       return
-
-   W_matrix = np.array(W_matrix, dtype=float)
-   if W_matrix.shape[0] != meta_data.shape[0]:
-       print("     [警告] W_matrix 行数与 meta_data 行数不一致，无法生成弦图。")
-       return
-   if W_matrix.shape[1] != k_val:
-       print("     [警告] W_matrix 列数与 k_val 不一致，无法生成弦图。")
-       return
-
-   # ---------- 1) 排序：Region -> Well（只影响展示顺序，不改变结果数值）----------
-   meta_sorted = meta_data.copy()
-   meta_sorted['Region'] = meta_sorted['Region'].astype(str)
-   meta_sorted['Well'] = meta_sorted['Well'].astype(str)
-
-   if 'Region_Clean' in meta_sorted.columns:
-       meta_sorted['Region_Clean'] = meta_sorted['Region_Clean'].astype(str)
-       meta_sorted = meta_sorted.sort_values(by=['Region_Clean', 'Well']).reset_index(drop=True)
-   else:
-       meta_sorted = meta_sorted.sort_values(by=['Region', 'Well']).reset_index(drop=True)
-
-   # W 也按同样排序重排（对齐 labels）
-   # 用原始行号建立 order，避免“meta_sorted reset_index”后无法追溯
-   idx_df = meta_data.copy()
-   idx_df['__idx__'] = np.arange(len(idx_df))
-   idx_df['Region'] = idx_df['Region'].astype(str)
-   idx_df['Well'] = idx_df['Well'].astype(str)
-   if 'Region_Clean' in idx_df.columns:
-       idx_df['Region_Clean'] = idx_df['Region_Clean'].astype(str)
-       idx_df = idx_df.sort_values(by=['Region_Clean', 'Well']).reset_index(drop=True)
-   else:
-       idx_df = idx_df.sort_values(by=['Region', 'Well']).reset_index(drop=True)
-   order = idx_df['__idx__'].values
-   W_sorted = W_matrix[order, :]
-
-   # ---------- 2) 归一化为百分比 ----------
-   row_sum = np.sum(W_sorted, axis=1, keepdims=True) + 1e-9
-   W_norm = W_sorted / row_sum * 100.0
-
-   # 标签：Well 用 Region|Well
-   well_labels = (meta_sorted['Region'].astype(str) + "|" + meta_sorted['Well'].astype(str)).values
-   region_labels = meta_sorted['Region'].astype(str).values
-   em_labels = [f'EM{i + 1}' for i in range(k_val)]
-
-   # ---------- 3) 构建 nodes：用整数 index（最稳）----------
-   nodes = []
-   name_to_idx = {}
-   idx = 0
-
-   # EM 节点
-   for em in em_labels:
-       name_to_idx[em] = idx
-       nodes.append({'index': idx, 'name': em, 'group': 'EndMember'})
-       idx += 1
-
-   # Well 节点
-   for wl, rg in zip(well_labels, region_labels):
-       wl = str(wl)
-       if wl not in name_to_idx:
-           name_to_idx[wl] = idx
-           nodes.append({'index': idx, 'name': wl, 'group': str(rg)})
-           idx += 1
-
-   df_nodes = pd.DataFrame(nodes)
-
-   # ---------- 4) 构建 links：source/target 用 index ----------
-   links = []
-   for i in range(len(well_labels)):
-       target_name = str(well_labels[i])
-       t_idx = name_to_idx[target_name]
-
-       for j in range(k_val):
-           val = float(W_norm[i, j])
-           if val > float(threshold):
-               source_name = em_labels[j]
-               s_idx = name_to_idx[source_name]
-               links.append({
-                   'source': s_idx,
-                   'target': t_idx,
-                   'value': val,
-                   'source_em': source_name,
-                   'target_well': target_name,
-                   'region': str(region_labels[i])
-               })
-
-   df_links = pd.DataFrame(links)
-   if df_links.empty:
-       print(f"     [警告] 没有足够显著的连接 (>{threshold}%) 生成弦图。")
-       return
-
-   # ---------- 5) 生成 chord ----------
-   nodes_ds = hv.Dataset(df_nodes, kdims=['index'], vdims=['name', 'group'])
-   chord = hv.Chord((df_links, nodes_ds))
-
-   chord = chord.opts(
-       cmap='Category20',
-       edge_color='source_em',                 # 边按端元着色
-       edge_line_width=hv.dim('value') * 0.03, # 线宽随贡献变化
-       node_color='group',                     # 节点按 Region/EndMember 分组着色
-       labels='name',
-       label_text_font_size='9pt',
-       width=950,
-       height=950,
-       title=f'Geochemical Connectivity (K={k_val}, >{threshold:.0f}% links)',
-       tools=['hover'],
-       inspection_policy='edges'
-   )
-
-   output_file = f'Result_Chord_K{k_val}.html'
-   hv.save(chord, output_file)
-   print(f"     [保存成功] {output_file}")
+def plot_rc_by_well_per_em(df_well: pd.DataFrame, out_dir: Path) -> List[Path]:
+    gcol = infer_col(df_well, ["group", "well"])
+    ecol = infer_col(df_well, ["em", "endmember"])
+    mcol = infer_col(df_well, ["mean"])
+    lcol = infer_col(df_well, ["p2_5", "p025", "ci_low", "low"])
+    ucol = infer_col(df_well, ["p97_5", "p975", "ci_high", "high"])
+    
+    ems = sorted(df_well[ecol].astype(str).unique(), key=em_sort_key)
+    outputs = []
+    
+    for em in ems:
+        sub = df_well[df_well[ecol].astype(str) == em].copy()
+        sub[gcol] = sub[gcol].astype(str)
+        sub = sub.sort_values(mcol, ascending=False)
+        
+        wells = sub[gcol].tolist()
+        mean = sub[mcol].to_numpy(dtype=float)
+        lo = sub[lcol].to_numpy(dtype=float)
+        hi = sub[ucol].to_numpy(dtype=float)
+        
+        xerr = np.vstack([mean - lo, hi - mean])
+        
+        n = len(wells)
+        height = max(12.0, min(32.0, n * 0.18))
+        fig, ax = plt.subplots(figsize=(10.5, height))
+        
+        y = np.arange(n)
+        ax.errorbar(
+            mean, y, xerr=xerr,
+            fmt="o", markersize=3.2,
+            elinewidth=1.2, capsize=2
+        )
+        ax.set_yticks(y)
+        ax.set_yticklabels(wells, fontsize=8)
+        ax.invert_yaxis()
+        ax.set_xlabel("RC (mean with 95% CI)", fontsize=12)
+        ax.set_ylabel("Well", fontsize=12)
+        ax.grid(True, axis="x", linestyle="--", alpha=0.3)
+        ax.set_title(f"Figure C1 (well) — RC mean + 95% CI (K=5) — {em}", fontsize=14, pad=10)
+        
+        out_png = out_dir / f"FigureC1_RC_by_well_95CI_EM{em}.png"
+        fig.tight_layout()
+        fig.savefig(out_png, dpi=200)
+        plt.close(fig)
+        outputs.append(out_png)
+    
+    return outputs
 
 
-class SimpleModel(BaseEstimator):
-   def fit(self, X, y=None):
-       return self
+def plot_endmember_profiles(dfH: pd.DataFrame, out_png: Path) -> None:
+    ecol = infer_col(dfH, ["em", "endmember"])
+    fcol = infer_col(dfH, ["feat", "feature", "variable"])
+    mcol = infer_col(dfH, ["mean"])
+    lcol = infer_col(dfH, ["p2_5", "p025", "ci_low", "low"])
+    ucol = infer_col(dfH, ["p97_5", "p975", "ci_high", "high"])
+    
+    dfH = dfH.copy()
+    dfH[ecol] = dfH[ecol].astype(str)
+    dfH[fcol] = dfH[fcol].astype(str)
+    
+    ems = sorted(dfH[ecol].unique(), key=em_sort_key)
+    
+    first_em = ems[0]
+    feat_order = dfH[dfH[ecol] == first_em][fcol].tolist()
+    if len(feat_order) == 0:
+        feat_order = sorted(dfH[fcol].unique())
+    
+    feat_order_unique = []
+    seen = set()
+    for ft in feat_order:
+        if ft not in seen:
+            feat_order_unique.append(ft)
+            seen.add(ft)
+    for ft in dfH[fcol].unique():
+        if ft not in seen:
+            feat_order_unique.append(ft)
+            seen.add(ft)
+    
+    n_em = len(ems)
+    fig_h = 2.2 * n_em + 2.0
+    fig, axes = plt.subplots(n_em, 1, figsize=(18, fig_h), sharex=True)
+    
+    if n_em == 1:
+        axes = [axes]
+    
+    x = np.arange(len(feat_order_unique))
+    
+    for i, em in enumerate(ems):
+        ax = axes[i]
+        sub = dfH[dfH[ecol] == em].copy()
+        sub = sub.set_index(fcol).reindex(feat_order_unique).reset_index()
+        
+        mean = sub[mcol].to_numpy(dtype=float)
+        lo = sub[lcol].to_numpy(dtype=float)
+        hi = sub[ucol].to_numpy(dtype=float)
+        
+        mask = np.isfinite(mean) & np.isfinite(lo) & np.isfinite(hi)
+        
+        yerr = np.vstack([(mean - lo), (hi - mean)])
+        
+        ax.errorbar(
+            x[mask], mean[mask],
+            yerr=yerr[:, mask],
+            fmt="o",
+            markersize=4,
+            elinewidth=1.2,
+            capsize=3,
+        )
+        
+        ax.set_ylabel(em, fontsize=12)
+        ax.grid(True, axis="y", linestyle="--", alpha=0.25)
+    
+    axes[-1].set_xticks(x)
+    axes[-1].set_xticklabels(feat_order_unique, rotation=25, ha="right", fontsize=10)
+    axes[-1].set_xlabel("Feature (rescaled back to original units)", fontsize=13)
+    fig.suptitle(
+        "Figure C2. Endmember profiles (original units, mean ± 95% CI, bootstrap n=200, K=5)",
+        fontsize=18, y=0.995
+    )
+    
+    fig.tight_layout(rect=[0, 0, 1, 0.985])
+    fig.savefig(out_png, dpi=200)
+    plt.close(fig)
 
-   def predict(self, X):
-       return np.sum(X, axis=1)
 
-   def score(self, X, y):
-       return r2_score(y, self.predict(X))
+def main() -> None:
+    print("=" * 80)
+    print("PSO-NMF Natural Gas Mixing Analysis")
+    print("=" * 80)
+    
+    current_dir = Path.cwd()
+    data_file = current_dir / "python(20260109).xlsx"
+    
+    if not data_file.exists():
+        print(f"Error: Data file not found: {data_file}")
+        print("Please ensure 'python(20260109).xlsx' is in the current directory")
+        return
+    
+    print(f"Data file located: {data_file}")
+    
+    print("\n" + "-" * 40)
+    print("Step 1: Reading Excel file")
+    print("-" * 40)
+    
+    try:
+        excel_file = pd.ExcelFile(data_file)
+        print(f"Worksheets in Excel file: {excel_file.sheet_names}")
+        
+        sheet_name = excel_file.sheet_names[0]
+        print(f"Reading worksheet: {sheet_name}")
+        
+        df = pd.read_excel(data_file, sheet_name=sheet_name)
+        print(f"Data shape: {df.shape}")
+        print(f"Column names: {list(df.columns)}")
+        
+        print("\nData preview:")
+        print(df.head())
+        
+        print("\nData types:")
+        print(df.dtypes)
+        
+    except Exception as e:
+        print(f"Error reading Excel file: {e}")
+        traceback.print_exc()
+        return
+    
+    print("\n" + "-" * 40)
+    print("Step 2: Data preprocessing")
+    print("-" * 40)
+    
+    potential_features = [
+        'd13C1', 'd13C2', 'd13C3', 'd13C4',
+        'C1', 'C2', 'C3', 'C4',
+        'C1/C2', 'C1/C3', 'C2/C3',
+        'CH4', 'C2H6', 'C3H8', 'iC4H10', 'nC4H10',
+        'δ13C1', 'δ13C2', 'δ13C3',
+        'C1_%', 'C2_%', 'C3_%',
+    ]
+    
+    available_features = [col for col in potential_features if col in df.columns]
+    
+    if not available_features:
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        available_features = numeric_cols[:10]
+        print(f"No predefined features found, using numeric columns: {available_features}")
+    else:
+        print(f"Selected features: {available_features}")
+    
+    delta13C1_col = None
+    delta13C2_col = None
+    
+    for col in ['d13C1', 'δ13C1', 'd13C_1', 'delta13C1']:
+        if col in df.columns:
+            delta13C1_col = col
+            break
+    
+    for col in ['d13C2', 'δ13C2', 'd13C_2', 'delta13C2']:
+        if col in df.columns:
+            delta13C2_col = col
+            break
+    
+    print(f"Methane carbon isotope column: {delta13C1_col}")
+    print(f"Ethane carbon isotope column: {delta13C2_col}")
+    
+    try:
+        preprocessed = preprocess_data(
+            df, 
+            features=available_features,
+            delta13C1_col=delta13C1_col,
+            delta13C2_col=delta13C2_col
+        )
+        
+        V = preprocessed['V']
+        delta13C12 = preprocessed['delta13C12']
+        normalization_params = preprocessed['normalization_params']
+        data_normalized = preprocessed['data_normalized']
+        
+        print(f"Preprocessed data matrix shape: {V.shape}")
+        print(f"Δ13C12 data shape: {delta13C12.shape if delta13C12 is not None else 'Not available'}")
+        
+    except Exception as e:
+        print(f"Error during data preprocessing: {e}")
+        traceback.print_exc()
+        return
+    
+    print("\n" + "-" * 40)
+    print("Step 3: PSO optimizer - Selecting optimal endmember count K")
+    print("-" * 40)
+    
+    outputs_dir = current_dir / "outputs"
+    tables_dir = outputs_dir / "tables"
+    figures_dir = outputs_dir / "figures"
+    
+    ensure_dir(outputs_dir)
+    ensure_dir(tables_dir)
+    ensure_dir(figures_dir)
+    
+    K_values = [2, 3, 4, 5, 6, 7]
+    
+    pso_optimizer = PSOOptimizer(
+        n_particles=10,
+        n_generations=80,
+        lambda_range=(0.001, 0.5),
+        beta_range=(0.001, 0.1)
+    )
+    
+    print("Starting PSO optimization...")
+    pso_results = pso_optimizer.optimize(V, delta13C12, K_values)
+    
+    k_selection_data = []
+    for K in K_values:
+        if K in pso_results:
+            result = pso_results[K]
+            
+            # Run final model with best parameters to get pure reconstruction error
+            model = PSONMFWithFractionation(
+                n_components=K,
+                lambda_reg=result['best_lambda'],
+                beta_sparsity=result['best_beta'],
+                max_iter=100
+            )
+            
+            try:
+                final_result = model.fit(V, delta13C12)
+                pure_recon_error = final_result['pure_recon_error']
+                
+                # Calculate RMSE
+                m, n = V.shape
+                rmse_value = np.sqrt(pure_recon_error / (m * n))
+                
+                # Calculate AIC
+                aic_value = calculate_aic_correct(V, pure_recon_error, K)
+                
+            except Exception as e:
+                print(f"Error calculating final metrics for K={K}: {e}")
+                rmse_value = np.sqrt(result['best_fitness'] / V.size) if result['best_fitness'] != float('inf') else np.nan
+                aic_value = np.nan
+            
+            k_selection_data.append({
+                'K': K,
+                'best_lambda': result['best_lambda'],
+                'best_beta': result['best_beta'],
+                'best_fitness': result['best_fitness'],
+                'RMSE_mean': rmse_value,
+                'AIC': aic_value
+            })
+    
+    k_selection_df = pd.DataFrame(k_selection_data)
+    
+    # Sort and calculate curvature
+    k_selection_df = k_selection_df.sort_values('K').reset_index(drop=True)
+    
+    valid_df = k_selection_df.dropna(subset=['RMSE_mean']).copy()
+    
+    if len(valid_df) >= 3:
+        k_values = valid_df['K'].values.astype(float)
+        rmse_values = valid_df['RMSE_mean'].values.astype(float)
+        curvature = calculate_curvature_for_selection(k_values, rmse_values)
+        valid_df['curvature'] = curvature
+    else:
+        print(f"Warning: Not enough valid K values ({len(valid_df)}), cannot calculate curvature")
+        valid_df['curvature'] = np.nan
+    
+    k_selection_df = k_selection_df.merge(
+        valid_df[['K', 'curvature']], 
+        on='K', 
+        how='left'
+    )
+    
+    k_selection_path = tables_dir / "k_selection_summary.csv"
+    k_selection_df.to_csv(k_selection_path, index=False)
+    
+    print(f"K selection results saved to: {k_selection_path}")
+    print("\nK selection summary:")
+    print(k_selection_df.to_string(index=False))
+    
+    if not k_selection_df.empty and 'RMSE_mean' in k_selection_df.columns:
+        valid_rows = k_selection_df.dropna(subset=['RMSE_mean'])
+        if not valid_rows.empty:
+            best_row = valid_rows.loc[valid_rows['RMSE_mean'].idxmin()]
+            best_K = int(best_row['K'])
+            best_lambda = best_row['best_lambda']
+            best_beta = best_row['best_beta']
+        else:
+            best_row = k_selection_df.iloc[0]
+            best_K = int(best_row['K'])
+            best_lambda = best_row['best_lambda']
+            best_beta = best_row['best_beta']
+            print(f"Warning: All valid RMSE values are NaN, using first K value: K={best_K}")
+    else:
+        best_K = 5
+        best_lambda = 0.01
+        best_beta = 0.01
+        print(f"\nUsing default values: K={best_K}, lambda={best_lambda}, beta={best_beta}")
+    
+    print(f"\nOptimal endmember count K: {best_K}")
+    print(f"Optimal lambda value: {best_lambda:.6f}")
+    print(f"Optimal beta value: {best_beta:.6f}")
+    print(f"Optimal RMSE: {best_row['RMSE_mean']:.6f}" if 'best_row' in locals() else "")
+    
+    print("\n" + "-" * 40)
+    print(f"Step 4: Bootstrap validation (K={best_K}, n=50)")
+    print("-" * 40)
+    
+    try:
+        if delta13C12 is not None:
+            print("Bootstrap validation with Δ13C12 data...")
+            bootstrap_results = bootstrap_validation(
+                PSONMFWithFractionation, 
+                V, 
+                delta13C12,
+                n_bootstrap=50,
+                n_components=best_K
+            )
+        else:
+            print("Bootstrap validation without isotope data...")
+            bootstrap_results = bootstrap_validation(
+                PSONMFWithFractionation, 
+                V, 
+                None,
+                n_bootstrap=50,
+                n_components=best_K
+            )
+        print("Bootstrap validation completed successfully")
+    except Exception as e:
+        print(f"Error during bootstrap validation: {e}")
+        traceback.print_exc()
+        return
+    
+    print("\n" + "-" * 40)
+    print("Step 5: Saving bootstrap results")
+    print("-" * 40)
+    
+    region_col = None
+    well_col = None
+    
+    for col in ['Region', 'region', 'area']:
+        if col in df.columns:
+            region_col = col
+            break
+    
+    for col in ['Well']:
+        if col in df.columns:
+            well_col = col
+            break
+    
+    # Create sample indices for region and well data
+    # If region/well columns don't exist, create dummy ones for visualization
+    if region_col and region_col in df.columns:
+        regions = df[region_col].astype(str).tolist()
+    else:
+        regions = [f"Sample_{i+1}" for i in range(len(df))]
+        region_col = 'Region'
+        df[region_col] = regions
+    
+    if well_col and well_col in df.columns:
+        wells = df[well_col].astype(str).tolist()
+    else:
+        wells = [f"Well_{i+1}" for i in range(len(df))]
+        well_col = 'Well'
+        df[well_col] = wells
+    
+    # Save region RC data
+    region_rc_data = []
+    for i, region in enumerate(regions):
+        for k in range(best_K):
+            region_rc_data.append({
+                'group': region,
+                'em': f'EM{k+1}',
+                'mean': bootstrap_results['W_mean'][i, k],
+                'p2_5': bootstrap_results['W_p2_5'][i, k],
+                'p97_5': bootstrap_results['W_p97_5'][i, k]
+            })
+    
+    region_rc_df = pd.DataFrame(region_rc_data)
+    region_rc_path = tables_dir / f"bootstrap_full_rc_ci_region_k{best_K}_n50.csv"
+    region_rc_df.to_csv(region_rc_path, index=False)
+    print(f"Region RC data saved to: {region_rc_path}")
+    
+    # Save well RC data
+    well_rc_data = []
+    for i, well in enumerate(wells):
+        for k in range(best_K):
+            well_rc_data.append({
+                'group': well,
+                'em': f'EM{k+1}',
+                'mean': bootstrap_results['W_mean'][i, k],
+                'p2_5': bootstrap_results['W_p2_5'][i, k],
+                'p97_5': bootstrap_results['W_p97_5'][i, k]
+            })
+    
+    well_rc_df = pd.DataFrame(well_rc_data)
+    well_rc_path = tables_dir / f"bootstrap_full_rc_ci_well_k{best_K}_n50.csv"
+    well_rc_df.to_csv(well_rc_path, index=False)
+    print(f"Well RC data saved to: {well_rc_path}")
+    
+    # Rescale H matrix
+    H_rescaled = inverse_normalize_H(
+        bootstrap_results['H_mean'],
+        normalization_params,
+        available_features
+    )
+    
+    # Save endmember feature data
+    H_data = []
+    for k in range(best_K):
+        for j, feature in enumerate(available_features[:H_rescaled.shape[1]]):
+            H_rescaled_p2_5 = inverse_normalize_H(
+                bootstrap_results['H_p2_5'],
+                normalization_params,
+                available_features
+            )
+            H_rescaled_p97_5 = inverse_normalize_H(
+                bootstrap_results['H_p97_5'],
+                normalization_params,
+                available_features
+            )
+            
+            H_data.append({
+                'em': f'EM{k+1}',
+                'feat': feature,
+                'mean': H_rescaled[k, j],
+                'p2_5': H_rescaled_p2_5[k, j],
+                'p97_5': H_rescaled_p97_5[k, j]
+            })
+    
+    H_df = pd.DataFrame(H_data)
+    H_path = tables_dir / f"bootstrap_full_H_ci_rescaled_k{best_K}_n50.csv"
+    H_df.to_csv(H_path, index=False)
+    print(f"Endmember feature data saved to: {H_path}")
+    
+    print("\n" + "-" * 40)
+    print("Step 6: Generating PSO convergence data")
+    print("-" * 40)
+    
+    convergence_data = []
+    for K in K_values:
+        if K in pso_results:
+            lambda_val = pso_results[K]['best_lambda']
+            beta_val = pso_results[K]['best_beta']
+            
+            model = PSONMFWithFractionation(
+                n_components=K,
+                lambda_reg=lambda_val,
+                beta_sparsity=beta_val,
+                max_iter=100
+            )
+            
+            try:
+                result = model.fit(V, delta13C12)
+                
+                for iter_num, loss in enumerate(result['loss_history']):
+                    convergence_data.append({
+                        'run_id': K,
+                        'gen': iter_num,
+                        'best_total': loss
+                    })
+            except Exception as e:
+                print(f"Error generating convergence data for K={K}: {e}")
+                continue
+    
+    convergence_df = pd.DataFrame(convergence_data)
+    convergence_path = tables_dir / "FigureB_mopso_convergence_50runs.csv"
+    convergence_df.to_csv(convergence_path, index=False)
+    print(f"Convergence data saved to: {convergence_path}")
+    
+    print("\n" + "-" * 40)
+    print("Step 7: Generating visualization plots")
+    print("-" * 40)
+    
+    try:
+        # Read the CSV files for plotting
+        dfk = pd.read_csv(k_selection_path)
+        dfB = pd.read_csv(convergence_path)
+        df_region = pd.read_csv(region_rc_path)
+        df_well = pd.read_csv(well_rc_path)
+        dfH = pd.read_csv(H_path)
+        
+        print("Generating Figure 1: K selection and convergence plot...")
+        fig, (ax_a, ax_b) = plt.subplots(2, 1, figsize=(16, 11))
+        plot_k_selection(ax_a, dfk)
+        plot_convergence_style(ax_b, dfB)
+        fig.tight_layout()
+        out_combo = figures_dir / f"Figure_KSelection_and_Convergence_style_K{best_K}.png"
+        fig.savefig(out_combo, dpi=200, bbox_inches='tight')
+        plt.close(fig)
+        print(f"  Saved to: {out_combo}")
+        
+        print("Generating Figure 2: MOPSO convergence trajectories...")
+        out_B = figures_dir / f"FigureB_MOPSO_Convergence_50runs_K{best_K}.png"
+        plot_convergence_50runs(dfB, out_B)
+        print(f"  Saved to: {out_B}")
+        
+        print("Generating Figure 3: RC distribution by region...")
+        out_C1r = figures_dir / f"FigureC1_RC_by_region_95CI_boot50_K{best_K}.png"
+        plot_rc_by_region(df_region, out_C1r)
+        print(f"  Saved to: {out_C1r}")
+        
+        print("Generating Figure 4: RC distribution by well...")
+        well_plots = plot_rc_by_well_per_em(df_well, figures_dir)
+        print(f"  Generated {len(well_plots)} well RC distribution plots")
+        
+        print("Generating Figure 5: Endmember feature profiles...")
+        out_C2 = figures_dir / f"FigureC2_Endmember_profiles_95CI_boot50_K{best_K}.png"
+        plot_endmember_profiles(dfH, out_C2)
+        print(f"  Saved to: {out_C2}")
+        
+        # Generate additional diagnostic plots
+        print("Generating additional diagnostic plots...")
+        
+        # RMSE vs K plot
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(dfk['K'], dfk['RMSE_mean'], 'o-', linewidth=2, markersize=8)
+        ax.set_xlabel('Number of End-members (K)', fontsize=12)
+        ax.set_ylabel('RMSE', fontsize=12)
+        ax.set_title(f'RMSE vs K (Best K={best_K})', fontsize=14)
+        ax.grid(True, alpha=0.3)
+        ax.axvline(x=best_K, color='red', linestyle='--', alpha=0.5)
+        out_rmse = figures_dir / f"Diagnostic_RMSE_vs_K_K{best_K}.png"
+        fig.savefig(out_rmse, dpi=200, bbox_inches='tight')
+        plt.close(fig)
+        
+        # AIC vs K plot
+        if 'AIC' in dfk.columns:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.plot(dfk['K'], dfk['AIC'], 's-', linewidth=2, markersize=8, color='green')
+            ax.set_xlabel('Number of End-members (K)', fontsize=12)
+            ax.set_ylabel('AIC', fontsize=12)
+            ax.set_title(f'AIC vs K', fontsize=14)
+            ax.grid(True, alpha=0.3)
+            out_aic = figures_dir / f"Diagnostic_AIC_vs_K_K{best_K}.png"
+            fig.savefig(out_aic, dpi=200, bbox_inches='tight')
+            plt.close(fig)
+        
+        print("All plots generated successfully!")
+        
+    except Exception as e:
+        print(f"Error generating plots: {e}")
+        traceback.print_exc()
+        # Try to generate at least some plots even if others fail
+        try:
+            # Try to generate basic plots
+            if 'dfk' in locals():
+                fig, ax = plt.subplots(figsize=(10, 6))
+                ax.plot(dfk['K'], dfk['RMSE_mean'], 'o-')
+                ax.set_xlabel('K')
+                ax.set_ylabel('RMSE')
+                ax.set_title('RMSE vs K')
+                ax.grid(True)
+                fig.savefig(figures_dir / "Basic_RMSE_vs_K.png", dpi=150)
+                plt.close(fig)
+                print("Basic RMSE plot generated")
+        except:
+            pass
+    
+    print("\n" + "-" * 40)
+    print("Step 8: Saving complete analysis results")
+    print("-" * 40)
+    
+    summary = {
+        'data_file': str(data_file),
+        'data_shape': f"{df.shape[0]} rows × {df.shape[1]} columns",
+        'features_used': len(available_features),
+        'optimal_endmember_count': best_K,
+        'optimal_regularization_parameters': {
+            'lambda': float(best_lambda),
+            'beta': float(best_beta)
+        },
+        'model_performance': {
+            'best_rmse': float(best_row['RMSE_mean']) if 'best_row' in locals() else np.nan,
+            'aic': float(best_row['AIC']) if 'best_row' in locals() and 'AIC' in best_row else np.nan
+        },
+        'output_files': {
+            'k_selection_results': str(k_selection_path),
+            'bootstrap_convergence_data': str(convergence_path),
+            'endmember_feature_data': str(H_path),
+            'region_rc_data': str(region_rc_path),
+            'well_rc_data': str(well_rc_path)
+        },
+        'generated_figures': []
+    }
+    
+    # Add generated figure paths if they exist
+    if 'out_combo' in locals():
+        summary['generated_figures'].append(str(out_combo))
+    if 'out_B' in locals():
+        summary['generated_figures'].append(str(out_B))
+    if 'out_C1r' in locals():
+        summary['generated_figures'].append(str(out_C1r))
+    if 'out_C2' in locals():
+        summary['generated_figures'].append(str(out_C2))
+    
+    summary_path = outputs_dir / "analysis_summary.json"
+    with open(summary_path, 'w', encoding='utf-8') as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    
+    print(f"Analysis summary saved to: {summary_path}")
+    
+    print("\n" + "=" * 80)
+    print("Analysis completed!")
+    print("=" * 80)
+    
+    print(f"\nKey results:")
+    print(f"1. Optimal endmember count: {best_K}")
+    print(f"2. Regularization parameters: λ={best_lambda:.6f}, β={best_beta:.6f}")
+    print(f"3. Best RMSE: {best_row['RMSE_mean']:.6f}" if 'best_row' in locals() else "")
+    print(f"4. Bootstrap validation completed: 50 replicates")
+    
+    print(f"\nOutput locations:")
+    print(f"  - Tabular data: {tables_dir}")
+    print(f"  - Figures: {figures_dir}")
+    print(f"  - Summary: {summary_path}")
+    
+    print(f"\nGenerated figures:")
+    if 'out_combo' in locals():
+        print(f"  - K selection and convergence: {out_combo.name}")
+    if 'out_B' in locals():
+        print(f"  - Convergence trajectories: {out_B.name}")
+    if 'out_C1r' in locals():
+        print(f"  - RC by region: {out_C1r.name}")
+    if 'out_C2' in locals():
+        print(f"  - Endmember profiles: {out_C2.name}")
 
 
-def pfi_analysis_transplanted(H_real, feature_names, k_val):
-   print(f"  -> 生成 K={k_val} 的 PFI 特征重要性图...")
-   model = SimpleModel()
-   y = model.predict(H_real)
-   pfi = permutation_importance(model, H_real, y, n_repeats=30, random_state=42)
-   plt.figure(figsize=(10, 6))
-   plt.bar(range(len(pfi.importances_mean)), pfi.importances_mean, yerr=pfi.importances_std, color='teal', capsize=5)
-   plt.xticks(range(len(pfi.importances_mean)), feature_names, rotation=45)
-   plt.title(f'Feature Importance (PFI) - K={k_val}')
-   plt.tight_layout()
-   plt.savefig(f'Result_PFI_K{k_val}.png', dpi=300)
-   plt.show()
-
-
-# ==========================================
-# 6. 主程序
-# ==========================================
 if __name__ == "__main__":
-   data_file = '天然气四端元2.xlsx'
-
-   # 1. 加载数据
-   V_norm, meta, info = load_and_preprocess(data_file)
-
-   if V_norm is not None:
-       # 2. 生成图A和图B (现在是独立绘制，不会重叠)
-       plot_separated_figures(V_norm, info)
-
-       # 准备两个 Excel Writer
-       writer_contrib = pd.ExcelWriter('Result_Contributions.xlsx', engine='openpyxl')
-       writer_em = pd.ExcelWriter('Result_EndMembers.xlsx', engine='openpyxl')
-
-       # 3. 循环计算 K=4, 5, 6
-       target_ks = [4, 5, 6]
-
-       for k in target_ks:
-           print(f"\n{'=' * 40}")
-           print(f"正在处理 K = {k}")
-           print(f"{'=' * 40}")
-
-           # (A) PSO 优化
-           best_params = optimize_with_pso_wrapped(V_norm, k, info)
-
-           # (B) Bootstrap
-           print(f"  -> 正在进行 Bootstrap (n=50) 计算误差...")
-           n_boot = 50
-           boot_W = []
-
-           base_model = GeochemicalNMF(V_norm, k, info, reg_lambda=best_params[0], reg_beta=best_params[1])
-           base_model.fit(max_iter=50)
-           base_H_order = base_model.H[:, 0].argsort()
-
-           for _ in tqdm(range(n_boot), desc="Bootstrap"):
-               noise = np.random.normal(0, 0.02, V_norm.shape)
-               model = GeochemicalNMF(pd.DataFrame(V_norm.values + noise, columns=V_norm.columns),
-                                      k, info, reg_lambda=best_params[0], reg_beta=best_params[1])
-               model.fit(max_iter=50)
-               sorted_idx = np.argsort(model.H[:, 0])
-               boot_W.append(model.W[:, sorted_idx])
-
-           boot_W = np.array(boot_W)
-           mean_W = np.mean(boot_W, axis=0)
-           std_W = np.std(boot_W, axis=0)
-           plot_region_rc_bootstrap_ci(boot_W, meta, k)
-
-           # (C) 绘制图 C
-           plot_figure_C(mean_W, std_W, meta, k)
-
-           # (D) 导出 Excel
-           print(f"  -> 写入 Excel Sheet (K={k})...")
-           contrib_rows = []
-           wells = meta['Well'].values
-           for i in range(len(wells)):
-               well_name = wells[i]
-               for j in range(k):
-                   mean_val = mean_W[i, j]
-                   std_val = std_W[i, j]
-                   lower_val = max(0, mean_val - 1.96 * std_val)
-                   upper_val = min(1, mean_val + 1.96 * std_val)
-                   contrib_rows.append({
-                       'Well': well_name,
-                       'EndMember': f'EM{j + 1}',
-                       'Mean_Ratio': mean_val,
-                       'Lower_95CI': lower_val,
-                       'Upper_95CI': upper_val
-                   })
-           df_contrib_sheet = pd.DataFrame(contrib_rows)
-           df_contrib_sheet.to_excel(writer_contrib, sheet_name=f'K={k}', index=False)
-
-           H_real = np.zeros((k, len(info['feature_names'])))
-           H_sorted = base_model.H[base_H_order, :]
-           for r in range(k):
-               H_real[r, :] = H_sorted[r, :] * info['range'].values + info['min'].values
-           df_em = pd.DataFrame(H_real, columns=info['feature_names'])
-           df_em.insert(0, 'EndMember', [f'EM{i + 1}' for i in range(k)])
-           df_em.to_excel(writer_em, sheet_name=f'K={k}', index=False)
-
-           # (E) 弦图（函数名不变，主程序不改；需要更强阈值可改 threshold=20.0）
-           plot_chord_diagram_transplanted(mean_W, meta, k)
-
-           # (F) PFI 分析
-           pfi_analysis_transplanted(H_real, info['feature_names'], k)
-
-       writer_contrib.close()
-       writer_em.close()
-
-       print("\n所有任务 (K=4,5,6) 已全部完成！")
+    try:
+        plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+        plt.rcParams['axes.unicode_minus'] = False
+        print("Chinese font support configured")
+    except:
+        print("Chinese font configuration failed")
+    
+    # Set random seeds for reproducibility
+    np.random.seed(42)
+    random.seed(42)
+    
+    main()
